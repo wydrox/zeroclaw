@@ -72,6 +72,12 @@ const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+fn loop_recovery_instruction(msg: &str) -> String {
+    format!(
+        "Loop recovery: {msg}\n\nDo not repeat the same tool call or tool strategy. Choose a different query/path/tool, summarize what is already known, or ask the user one concise clarifying question."
+    )
+}
+
 // History management moved to `super::history`.
 pub use super::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
@@ -905,6 +911,7 @@ pub async fn run_tool_call_loop(
             max_repeats: pacing.loop_detection_max_repeats,
         },
     );
+    let mut loop_recovery_injected_at_iteration: Option<usize> = None;
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
@@ -1890,7 +1897,7 @@ pub async fn run_tool_call_loop(
         let mut detection_relevant_output = String::new();
         // Use enumerate *before* filter_map so result_index stays aligned with
         // tool_calls even when some ordered_results entries are None.
-        for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
+        for (result_index, (tool_name, tool_call_id, mut outcome)) in ordered_results
             .into_iter()
             .enumerate()
             .filter_map(|(i, opt)| opt.map(|v| (i, v)))
@@ -1911,29 +1918,59 @@ pub async fn run_tool_call_loop(
                         append_or_merge_system_message(history, format!("[Loop Detection] {msg}"));
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
-                        tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
-                        // Replace the tool output with the block message.
-                        // We still continue the loop so the LLM sees the block feedback.
+                        tracing::warn!(tool = %tool_name, %msg, "loop detector recovery injected");
+                        let recovery = loop_recovery_instruction(msg);
                         append_or_merge_system_message(
                             history,
-                            format!("[Loop Detection — BLOCKED] {msg}"),
+                            format!("[Loop Detection — RECOVERY] {recovery}"),
                         );
+                        outcome.output = recovery.clone();
+                        outcome.success = false;
+                        outcome.error_reason = Some(recovery);
+                        if loop_recovery_injected_at_iteration.is_none() {
+                            loop_recovery_injected_at_iteration = Some(iteration);
+                        }
                     }
                     crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
-                        runtime_trace::record_event(
-                            "loop_detector_circuit_breaker",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&msg),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "tool": tool_name,
-                            }),
-                        );
-                        anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                        if loop_recovery_injected_at_iteration == Some(iteration) {
+                            let recovery = loop_recovery_instruction(&msg);
+                            tracing::warn!(tool = %tool_name, %msg, "loop detector break suppressed until model sees recovery");
+                            runtime_trace::record_event(
+                                "loop_detector_recovery_suppressed_break",
+                                Some(channel_name),
+                                Some(provider_name),
+                                Some(model),
+                                Some(&turn_id),
+                                Some(false),
+                                Some(&msg),
+                                serde_json::json!({
+                                    "iteration": iteration + 1,
+                                    "tool": tool_name,
+                                }),
+                            );
+                            append_or_merge_system_message(
+                                history,
+                                format!("[Loop Detection — RECOVERY] {recovery}"),
+                            );
+                            outcome.output = recovery.clone();
+                            outcome.success = false;
+                            outcome.error_reason = Some(recovery);
+                        } else {
+                            runtime_trace::record_event(
+                                "loop_detector_circuit_breaker",
+                                Some(channel_name),
+                                Some(provider_name),
+                                Some(model),
+                                Some(&turn_id),
+                                Some(false),
+                                Some(&msg),
+                                serde_json::json!({
+                                    "iteration": iteration + 1,
+                                    "tool": tool_name,
+                                }),
+                            );
+                            anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                        }
                     }
                 }
             }
@@ -5664,6 +5701,162 @@ mod tests {
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_recovery_before_loop_detector_abort() {
+        let repeated = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#;
+        let provider = ScriptedProvider::from_text_responses(vec![repeated, "done"]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run repeated tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("loop should recover once before aborting");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "duplicate tool calls should still only execute once"
+        );
+
+        let tool_results = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("prompt-mode tool result payload should be present");
+        assert!(tool_results.content.contains("Loop recovery"));
+        assert!(
+            tool_results
+                .content
+                .contains("Do not repeat the same tool call")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_aborts_if_repetition_continues_after_recovery() {
+        let repeated = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#;
+        let repeated_again = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#;
+        let provider = ScriptedProvider::from_text_responses(vec![repeated, repeated_again]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run repeated tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect_err("continued repetition after recovery should abort");
+
+        let err = err.to_string();
+        assert!(err.contains("Agent loop aborted by loop detector"));
+        assert!(err.contains("Circuit breaker"));
     }
 
     #[tokio::test]

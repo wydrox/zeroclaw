@@ -250,6 +250,261 @@ fn channel_message_timeout_budget_secs_with_cap(
     message_timeout_secs.saturating_mul(scale)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelFailureKind {
+    LoopDetected,
+    ToolDenied,
+    ContextOverflow,
+    Timeout,
+    Auth,
+    Provider,
+    Unknown,
+}
+
+fn webhook_response_policy<'a>(
+    config: &'a Config,
+    channel_name: &str,
+) -> Option<&'a zeroclaw_config::schema::ChannelResponsePolicyConfig> {
+    if channel_name != "webhook" {
+        return None;
+    }
+    config
+        .channels
+        .webhook
+        .as_ref()
+        .and_then(|webhook| webhook.response_policy.as_ref())
+}
+
+fn response_policy_formats_audio(
+    policy: &zeroclaw_config::schema::ChannelResponsePolicyConfig,
+) -> bool {
+    policy.audio_safe
+        || matches!(
+            policy.mode,
+            zeroclaw_config::schema::ChannelResponseMode::Voice
+        )
+}
+
+fn response_policy_uses_audio_safe_errors(
+    policy: &zeroclaw_config::schema::ChannelResponsePolicyConfig,
+) -> bool {
+    if policy.allow_raw_errors {
+        return false;
+    }
+    response_policy_formats_audio(policy)
+        || matches!(
+            policy.error_style,
+            zeroclaw_config::schema::ChannelErrorStyle::Natural
+        )
+}
+
+fn classify_channel_failure(error: &str) -> ChannelFailureKind {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("loop detector") || lower.contains("circuit breaker") {
+        ChannelFailureKind::LoopDetected
+    } else if lower.contains("denied by user")
+        || lower.contains("approval")
+        || lower.contains("not allowed by security policy")
+    {
+        ChannelFailureKind::ToolDenied
+    } else if lower.contains("context window") || lower.contains("context length") {
+        ChannelFailureKind::ContextOverflow
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        ChannelFailureKind::Timeout
+    } else if lower.contains("auth") || lower.contains("unauthorized") || lower.contains("401") {
+        ChannelFailureKind::Auth
+    } else if lower.contains("provider") || lower.contains("api") || lower.contains("model") {
+        ChannelFailureKind::Provider
+    } else {
+        ChannelFailureKind::Unknown
+    }
+}
+
+fn voice_safe_error_message(kind: ChannelFailureKind) -> &'static str {
+    match kind {
+        ChannelFailureKind::LoopDetected => {
+            "Utknąłem przy powtarzaniu tej samej operacji. Mam spróbować inną strategią albo przekazać to głównemu agentowi?"
+        }
+        ChannelFailureKind::ToolDenied => {
+            "Nie mam teraz zgody albo dostępu do tej akcji. Mam przygotować plan albo poprosić o potwierdzenie?"
+        }
+        ChannelFailureKind::ContextOverflow => {
+            "Ta rozmowa zrobiła się za długa dla bieżącego kontekstu. Powtórz proszę ostatnią prośbę krócej."
+        }
+        ChannelFailureKind::Timeout => {
+            "Nie zdążyłem dokończyć tej prośby w czasie. Mam spróbować jeszcze raz krótszym krokiem?"
+        }
+        ChannelFailureKind::Auth => {
+            "Wygląda na problem z autoryzacją usługi. Mam zostawić to do sprawdzenia głównemu agentowi?"
+        }
+        ChannelFailureKind::Provider => {
+            "Model albo dostawca zwrócił błąd. Mam spróbować ponownie albo przekazać to głównemu agentowi?"
+        }
+        ChannelFailureKind::Unknown => {
+            "Przepraszam, coś poszło nie tak przy obsłudze tej prośby. Mam spróbować inaczej?"
+        }
+    }
+}
+
+fn channel_error_response_text(
+    config: &Config,
+    channel_name: &str,
+    kind: ChannelFailureKind,
+    raw_text: &str,
+) -> String {
+    let Some(policy) = webhook_response_policy(config, channel_name) else {
+        return raw_text.to_string();
+    };
+    if !response_policy_uses_audio_safe_errors(policy) {
+        return raw_text.to_string();
+    }
+    let text = voice_safe_error_message(kind);
+    if let Some(max_chars) = policy.max_spoken_chars {
+        truncate_with_ellipsis(text, max_chars)
+    } else {
+        text.to_string()
+    }
+}
+
+fn channel_success_response_text(config: &Config, channel_name: &str, raw_text: &str) -> String {
+    let Some(policy) = webhook_response_policy(config, channel_name) else {
+        return raw_text.to_string();
+    };
+    if !response_policy_formats_audio(policy) {
+        return raw_text.to_string();
+    }
+    crate::audio_safe::format_for_tts(raw_text, policy.max_spoken_chars)
+}
+
+const VOICE_RESPONSE_POLICY_SYSTEM_INSTRUCTIONS: &str = "Voice response policy:\n\
+- Reply in short, natural spoken Polish that is safe for TTS. Avoid markdown, tables, code fences, raw stack traces, and raw tool/API errors.\n\
+- For ambiguous, broad, or implementation-heavy requests that are hard to execute safely from dictation, do not start a long tool session immediately. First summarize the requested change in one sentence and ask the user to choose: continue locally step by step, or hand off to the main agent.\n\
+- Use a spoken choice prompt like: \"To wygląda na większą zmianę. Mogę poprowadzić ją tutaj krok po kroku albo przygotować przekazanie głównemu agentowi. Co wybierasz?\"\n\
+- If the user chooses local execution, proceed in small verified steps. Before medium-risk or multi-step local actions, ask a one-sentence yes/no confirmation such as: \"Mam wykonać ten plan lokalnie? Powiedz: tak albo nie.\" Wait for confirmation and keep the scope limited to the confirmed action.\n\
+- If the user chooses handoff, prepare a concise handoff summary with the goal, known context, open questions, and suggested next agent. Do not claim the handoff was executed unless a real tool or channel completed it.";
+
+fn append_response_policy_system_instructions(
+    prompt: &mut String,
+    config: &Config,
+    channel_name: &str,
+) {
+    let Some(policy) = webhook_response_policy(config, channel_name) else {
+        return;
+    };
+    if !response_policy_formats_audio(policy) {
+        return;
+    }
+    if !prompt.is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(VOICE_RESPONSE_POLICY_SYSTEM_INSTRUCTIONS);
+}
+
+fn voice_event_metadata_from_content(content: &str) -> Option<serde_json::Value> {
+    let (_, after_header) = content.split_once("[Voice event metadata]")?;
+    let block = after_header
+        .split_once("[/Voice event metadata]")
+        .map(|(block, _)| block)
+        .unwrap_or(after_header);
+
+    let mut root = serde_json::Map::new();
+    let mut timing = serde_json::Map::new();
+    for line in block.lines() {
+        let line = line.trim();
+        let Some(line) = line.strip_prefix("- ") else {
+            continue;
+        };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = parse_voice_metadata_trace_value(value.trim());
+        if let Some(timing_key) = key.strip_prefix("timing.") {
+            timing.insert(timing_key.to_string(), value);
+        } else if !key.is_empty() {
+            root.insert(key.to_string(), value);
+        }
+    }
+
+    if !timing.is_empty() {
+        root.insert("timing".to_string(), serde_json::Value::Object(timing));
+    }
+
+    (!root.is_empty()).then_some(serde_json::Value::Object(root))
+}
+
+fn parse_voice_metadata_trace_value(raw: &str) -> serde_json::Value {
+    if let Ok(value) = raw.parse::<u64>() {
+        return serde_json::Value::from(value);
+    }
+    if let Ok(value) = raw.parse::<i64>() {
+        return serde_json::Value::from(value);
+    }
+    if let Ok(value) = raw.parse::<f64>()
+        && let Some(number) = serde_json::Number::from_f64(value)
+    {
+        return serde_json::Value::Number(number);
+    }
+    match raw {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        _ => serde_json::Value::String(raw.to_string()),
+    }
+}
+
+fn insert_voice_event_metadata(
+    details: &mut serde_json::Value,
+    voice_event_metadata: Option<&serde_json::Value>,
+) {
+    let Some(voice_event) = voice_event_metadata else {
+        return;
+    };
+    if let serde_json::Value::Object(map) = details {
+        map.insert("voice_event".to_string(), voice_event.clone());
+    }
+}
+
+fn record_voice_turn_timeline(
+    stage: &str,
+    msg: &ChannelMessage,
+    provider_name: Option<&str>,
+    model: Option<&str>,
+    success: Option<bool>,
+    message: Option<&str>,
+    elapsed_ms: u64,
+    voice_event_metadata: Option<&serde_json::Value>,
+    extra: serde_json::Value,
+) {
+    let Some(voice_event) = voice_event_metadata else {
+        return;
+    };
+
+    let mut details = serde_json::json!({
+        "stage": stage,
+        "sender": msg.sender,
+        "message_id": msg.id,
+        "reply_target": msg.reply_target,
+        "elapsed_ms": elapsed_ms,
+        "voice_event": voice_event,
+    });
+    if let (serde_json::Value::Object(base), serde_json::Value::Object(extra)) =
+        (&mut details, extra)
+    {
+        base.extend(extra);
+    }
+
+    runtime_trace::record_event(
+        "voice_turn_timeline",
+        Some(msg.channel.as_str()),
+        provider_name,
+        model,
+        None,
+        success,
+        message,
+        details,
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChannelRouteSelection {
     provider: String,
@@ -2734,6 +2989,14 @@ async fn process_channel_message(
         msg.sender,
         truncate_with_ellipsis(&msg.content, 80)
     );
+    let voice_event_metadata = voice_event_metadata_from_content(&msg.content);
+    let mut inbound_trace_details = serde_json::json!({
+        "sender": msg.sender,
+        "message_id": msg.id,
+        "reply_target": msg.reply_target,
+        "content_preview": truncate_with_ellipsis(&msg.content, 160),
+    });
+    insert_voice_event_metadata(&mut inbound_trace_details, voice_event_metadata.as_ref());
     runtime_trace::record_event(
         "channel_message_inbound",
         Some(msg.channel.as_str()),
@@ -2742,12 +3005,18 @@ async fn process_channel_message(
         None,
         None,
         None,
-        serde_json::json!({
-            "sender": msg.sender,
-            "message_id": msg.id,
-            "reply_target": msg.reply_target,
-            "content_preview": truncate_with_ellipsis(&msg.content, 160),
-        }),
+        inbound_trace_details,
+    );
+    record_voice_turn_timeline(
+        "inbound",
+        &msg,
+        None,
+        None,
+        None,
+        Some("inbound voice event received"),
+        0,
+        voice_event_metadata.as_ref(),
+        serde_json::json!({}),
     );
 
     // ── Hook: on_message_received (modifying) ────────────
@@ -3026,6 +3295,11 @@ async fn process_channel_message(
         &msg.channel,
         &msg.reply_target,
         &msg.sender,
+    );
+    append_response_policy_system_instructions(
+        &mut system_prompt,
+        ctx.prompt_config.as_ref(),
+        &msg.channel,
     );
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
@@ -3451,6 +3725,29 @@ async fn process_channel_message(
     #[allow(clippy::cast_possible_truncation)]
     let total_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
+    let llm_status = match &llm_result {
+        LlmExecutionResult::Completed(Ok(Ok(_))) => "completed",
+        LlmExecutionResult::Completed(Ok(Err(_))) => "agent_error",
+        LlmExecutionResult::Completed(Err(_)) => "timeout",
+        LlmExecutionResult::Cancelled => "cancelled",
+    };
+    record_voice_turn_timeline(
+        "llm_complete",
+        &msg,
+        Some(route.provider.as_str()),
+        Some(route.model.as_str()),
+        Some(matches!(
+            &llm_result,
+            LlmExecutionResult::Completed(Ok(Ok(_)))
+        )),
+        None,
+        total_ms,
+        voice_event_metadata.as_ref(),
+        serde_json::json!({
+            "llm_call_ms": llm_call_ms,
+            "status": llm_status,
+        }),
+    );
 
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
@@ -3584,6 +3881,12 @@ async fn process_channel_message(
                 }
             }
 
+            delivered_response = channel_success_response_text(
+                ctx.prompt_config.as_ref(),
+                &msg.channel,
+                &delivered_response,
+            );
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -3596,6 +3899,21 @@ async fn process_channel_message(
                     "sender": msg.sender,
                     "elapsed_ms": started_at.elapsed().as_millis(),
                     "response": scrub_credentials(&delivered_response),
+                }),
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let outbound_elapsed_ms = started_at.elapsed().as_millis() as u64;
+            record_voice_turn_timeline(
+                "outbound_prepared",
+                &msg,
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                Some(true),
+                None,
+                outbound_elapsed_ms,
+                voice_event_metadata.as_ref(),
+                serde_json::json!({
+                    "response_chars": delivered_response.chars().count(),
                 }),
             );
 
@@ -3750,11 +4068,17 @@ async fn process_channel_message(
                 }
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
+                let raw_error_text = if compacted {
                     "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
                 } else {
                     "⚠️ Context window exceeded for this conversation. Please resend your last message."
                 };
+                let error_text = channel_error_response_text(
+                    ctx.prompt_config.as_ref(),
+                    &msg.channel,
+                    ChannelFailureKind::ContextOverflow,
+                    raw_error_text,
+                );
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
@@ -3777,7 +4101,7 @@ async fn process_channel_message(
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
+                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
                             .await;
                     } else {
                         let _ = channel
@@ -3834,14 +4158,26 @@ async fn process_channel_message(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
+                    let raw_error_text = format!("⚠️ Error: {e}");
+                    let kind = if zeroclaw_providers::reliable::is_auth_error(&e) {
+                        ChannelFailureKind::Auth
+                    } else {
+                        classify_channel_failure(&e.to_string())
+                    };
+                    let error_text = channel_error_response_text(
+                        ctx.prompt_config.as_ref(),
+                        &msg.channel,
+                        kind,
+                        &raw_error_text,
+                    );
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &error_text)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(error_text, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -3880,11 +4216,17 @@ async fn process_channel_message(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
+                let raw_error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = channel_error_response_text(
+                    ctx.prompt_config.as_ref(),
+                    &msg.channel,
+                    ChannelFailureKind::Timeout,
+                    raw_error_text,
+                );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
                         .await;
                 } else {
                     let _ = channel
@@ -6319,6 +6661,170 @@ mod tests {
         assert_eq!(channel_message_timeout_budget_secs(300, 1), 300);
         assert_eq!(channel_message_timeout_budget_secs(300, 2), 600);
         assert_eq!(channel_message_timeout_budget_secs(300, 3), 900);
+    }
+
+    fn config_with_voice_response_policy() -> Config {
+        let mut config = Config::default();
+        config.channels.webhook = Some(zeroclaw_config::schema::WebhookConfig {
+            enabled: true,
+            port: 42881,
+            response_policy: Some(zeroclaw_config::schema::ChannelResponsePolicyConfig {
+                mode: zeroclaw_config::schema::ChannelResponseMode::Voice,
+                audio_safe: true,
+                max_spoken_chars: None,
+                error_style: zeroclaw_config::schema::ChannelErrorStyle::Natural,
+                allow_raw_errors: false,
+            }),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn channel_error_response_preserves_raw_without_policy() {
+        let config = Config::default();
+        let raw = "⚠️ Error: Agent loop aborted by loop detector: Circuit breaker: tool 'glob_search' called 5 times";
+        assert_eq!(
+            channel_error_response_text(&config, "webhook", classify_channel_failure(raw), raw,),
+            raw
+        );
+    }
+
+    #[test]
+    fn voice_response_policy_maps_loop_detector_error() {
+        let config = config_with_voice_response_policy();
+        let raw = "⚠️ Error: Agent loop aborted by loop detector: Circuit breaker: tool 'glob_search' called 5 times";
+        let mapped =
+            channel_error_response_text(&config, "webhook", classify_channel_failure(raw), raw);
+        assert!(mapped.contains("Utknąłem"));
+        assert!(!mapped.contains("glob_search"));
+        assert!(!mapped.contains("Circuit breaker"));
+    }
+
+    #[test]
+    fn voice_response_policy_maps_timeout_context_and_auth_errors() {
+        let config = config_with_voice_response_policy();
+        let timeout = channel_error_response_text(
+            &config,
+            "webhook",
+            ChannelFailureKind::Timeout,
+            "⚠️ Request timed out while waiting for the model. Please try again.",
+        );
+        let context = channel_error_response_text(
+            &config,
+            "webhook",
+            ChannelFailureKind::ContextOverflow,
+            "⚠️ Context window exceeded for this conversation.",
+        );
+        let auth = channel_error_response_text(
+            &config,
+            "webhook",
+            ChannelFailureKind::Auth,
+            "⚠️ Error: provider returned 401 unauthorized",
+        );
+        assert!(timeout.contains("Nie zdążyłem"));
+        assert!(context.contains("kontekstu"));
+        assert!(auth.contains("autoryzacją"));
+        assert!(!timeout.contains("Request timed out"));
+        assert!(!context.contains("Context window"));
+        assert!(!auth.contains("401"));
+    }
+
+    #[test]
+    fn voice_response_policy_respects_allow_raw_errors() {
+        let mut config = config_with_voice_response_policy();
+        config
+            .channels
+            .webhook
+            .as_mut()
+            .unwrap()
+            .response_policy
+            .as_mut()
+            .unwrap()
+            .allow_raw_errors = true;
+        let raw = "⚠️ Error: provider returned 401 unauthorized";
+        assert_eq!(
+            channel_error_response_text(&config, "webhook", ChannelFailureKind::Auth, raw),
+            raw
+        );
+    }
+
+    #[test]
+    fn voice_response_policy_formats_successful_replies_for_tts() {
+        let config = config_with_voice_response_policy();
+        let raw = "## Pogoda\n- Temperatura: **18°C**\n- Wilgotność: 40%";
+        let formatted = channel_success_response_text(&config, "webhook", raw);
+        assert_eq!(
+            formatted,
+            "Pogoda Temperatura: 18 stopni Celsjusza Wilgotność: 40 procent"
+        );
+    }
+
+    #[test]
+    fn voice_response_policy_does_not_format_non_webhook_replies() {
+        let config = config_with_voice_response_policy();
+        let raw = "**18°C**";
+        assert_eq!(channel_success_response_text(&config, "slack", raw), raw);
+    }
+
+    #[test]
+    fn voice_response_policy_appends_handoff_choice_instructions() {
+        let config = config_with_voice_response_policy();
+        let mut prompt = "base prompt".to_string();
+
+        append_response_policy_system_instructions(&mut prompt, &config, "webhook");
+
+        assert!(prompt.contains("Voice response policy"));
+        assert!(prompt.contains("continue locally"));
+        assert!(prompt.contains("hand off to the main agent"));
+        assert!(prompt.contains("Co wybierasz?"));
+    }
+
+    #[test]
+    fn voice_response_policy_appends_medium_task_confirmation_instructions() {
+        let config = config_with_voice_response_policy();
+        let mut prompt = "base prompt".to_string();
+
+        append_response_policy_system_instructions(&mut prompt, &config, "webhook");
+
+        assert!(prompt.contains("Before medium-risk or multi-step local actions"));
+        assert!(prompt.contains("Mam wykonać ten plan lokalnie?"));
+        assert!(prompt.contains("Wait for confirmation"));
+    }
+
+    #[test]
+    fn normal_response_policy_does_not_append_handoff_choice_instructions() {
+        let mut config = Config::default();
+        config.channels.webhook = Some(zeroclaw_config::schema::WebhookConfig {
+            enabled: true,
+            port: 42881,
+            response_policy: Some(zeroclaw_config::schema::ChannelResponsePolicyConfig::default()),
+            ..Default::default()
+        });
+        let mut prompt = "base prompt".to_string();
+
+        append_response_policy_system_instructions(&mut prompt, &config, "webhook");
+
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[test]
+    fn voice_event_metadata_parser_extracts_trace_fields() {
+        let content = "jaka pogoda\n\n[Voice event metadata]\n- mode: agent\n- stt_backend: sherpa\n- stt_latency_ms: 812\n- audio_id: utt-42\n- timing.record_ms: 1430\n- timing.hotword: false\n[/Voice event metadata]";
+
+        let metadata = voice_event_metadata_from_content(content).expect("metadata should parse");
+
+        assert_eq!(metadata["mode"], "agent");
+        assert_eq!(metadata["stt_backend"], "sherpa");
+        assert_eq!(metadata["stt_latency_ms"], 812);
+        assert_eq!(metadata["audio_id"], "utt-42");
+        assert_eq!(metadata["timing"]["record_ms"], 1430);
+        assert_eq!(metadata["timing"]["hotword"], false);
+    }
+
+    #[test]
+    fn voice_event_metadata_parser_ignores_plain_messages() {
+        assert!(voice_event_metadata_from_content("plain message").is_none());
     }
 
     #[test]

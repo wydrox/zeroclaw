@@ -1,0 +1,24 @@
+# Partial ZeroClaw config for a Raspberry Pi push-to-talk voice profile.
+# Merge these sections into the runtime config used by the Pi voice daemon.
+
+[channels.webhook]
+enabled = true
+port = 42881
+listen_path = "/voice"
+send_url = "http://127.0.0.1:42882/tts"
+# Prefer a file/env-managed secret in deployment; this placeholder is documentation only.
+secret = "change-me"
+
+[channels.webhook.response_policy]
+mode = "voice"
+audio_safe = true
+error_style = "natural"
+allow_raw_errors = false
+max_spoken_chars = 600
+
+[pacing]
+loop_detection_enabled = true
+loop_detection_window_size = 20
+loop_detection_max_repeats = 3
+# Optional grace for slow local models; leave unset for immediate pattern detection.
+# loop_detection_min_elapsed_secs = 60

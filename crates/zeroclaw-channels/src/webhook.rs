@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// Generic Webhook channel — receives messages via HTTP POST and sends replies
@@ -15,6 +16,166 @@ pub struct WebhookChannel {
     secret: Option<String>,
 }
 
+const VOICE_EVENT_METADATA_HEADER: &str = "[Voice event metadata]";
+const VOICE_EVENT_METADATA_FOOTER: &str = "[/Voice event metadata]";
+
+/// Optional metadata supplied by local push-to-talk voice clients.
+///
+/// This keeps the generic webhook payload backward-compatible while allowing
+/// Raspberry Pi voice senders to include STT/runtime details that the agent can
+/// use for spoken UX decisions and trace correlation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+struct IncomingVoiceEvent {
+    /// Interaction mode, e.g. `agent`, `radio_command`, or `confirmation`.
+    #[serde(default)]
+    mode: Option<String>,
+    /// STT backend that produced `content`, e.g. `sherpa`, `whisper`, `vosk`.
+    #[serde(default)]
+    stt_backend: Option<String>,
+    /// STT/transcription latency in milliseconds.
+    #[serde(default, alias = "stt_ms", alias = "transcription_ms")]
+    stt_latency_ms: Option<u64>,
+    /// End-to-end or sender-observed latency in milliseconds.
+    #[serde(default, alias = "latency", alias = "elapsed_ms")]
+    latency_ms: Option<u64>,
+    /// Full turn latency when the sender distinguishes it from `latency_ms`.
+    #[serde(default, alias = "total_ms")]
+    total_latency_ms: Option<u64>,
+    /// Stable audio/utterance id for trace correlation.
+    #[serde(default, alias = "utterance_id")]
+    audio_id: Option<String>,
+    /// Optional local audio path/id for debugging. This is presented as metadata
+    /// only; channels must not try to read the path unless explicitly asked.
+    #[serde(default, alias = "audio_file")]
+    audio_path: Option<String>,
+    /// Timing breakdown supplied by the client, e.g. `{record_ms, stt_ms}`.
+    #[serde(default)]
+    timing: BTreeMap<String, serde_json::Value>,
+    /// Alias accepted by some clients.
+    #[serde(default)]
+    timings: BTreeMap<String, serde_json::Value>,
+}
+
+impl IncomingVoiceEvent {
+    fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.stt_backend.is_none()
+            && self.stt_latency_ms.is_none()
+            && self.latency_ms.is_none()
+            && self.total_latency_ms.is_none()
+            && self.audio_id.is_none()
+            && self.audio_path.is_none()
+            && self.timing.is_empty()
+            && self.timings.is_empty()
+    }
+
+    fn merge_missing(&mut self, other: IncomingVoiceEvent) {
+        if self.mode.is_none() {
+            self.mode = other.mode;
+        }
+        if self.stt_backend.is_none() {
+            self.stt_backend = other.stt_backend;
+        }
+        if self.stt_latency_ms.is_none() {
+            self.stt_latency_ms = other.stt_latency_ms;
+        }
+        if self.latency_ms.is_none() {
+            self.latency_ms = other.latency_ms;
+        }
+        if self.total_latency_ms.is_none() {
+            self.total_latency_ms = other.total_latency_ms;
+        }
+        if self.audio_id.is_none() {
+            self.audio_id = other.audio_id;
+        }
+        if self.audio_path.is_none() {
+            self.audio_path = other.audio_path;
+        }
+        self.timing.extend(other.timing);
+        self.timings.extend(other.timings);
+    }
+
+    fn metadata_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        push_optional_metadata(&mut lines, "mode", self.mode.as_deref());
+        push_optional_metadata(&mut lines, "stt_backend", self.stt_backend.as_deref());
+        push_optional_metadata(
+            &mut lines,
+            "stt_latency_ms",
+            self.stt_latency_ms.map(|v| v.to_string()).as_deref(),
+        );
+        push_optional_metadata(
+            &mut lines,
+            "latency_ms",
+            self.latency_ms.map(|v| v.to_string()).as_deref(),
+        );
+        push_optional_metadata(
+            &mut lines,
+            "total_latency_ms",
+            self.total_latency_ms.map(|v| v.to_string()).as_deref(),
+        );
+        push_optional_metadata(&mut lines, "audio_id", self.audio_id.as_deref());
+        push_optional_metadata(&mut lines, "audio_path", self.audio_path.as_deref());
+
+        for (key, value) in self.timing.iter().chain(self.timings.iter()) {
+            if let Some(value) = metadata_value_to_string(value) {
+                lines.push(format!("- timing.{}: {}", clean_metadata_text(key), value));
+            }
+        }
+
+        lines
+    }
+
+    fn context_block(&self) -> Option<String> {
+        let lines = self.metadata_lines();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{VOICE_EVENT_METADATA_HEADER}\n{}\n{VOICE_EVENT_METADATA_FOOTER}",
+            lines.join("\n")
+        ))
+    }
+}
+
+fn push_optional_metadata(lines: &mut Vec<String>, key: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    let value = clean_metadata_text(value);
+    if !value.is_empty() {
+        lines.push(format!("- {key}: {value}"));
+    }
+}
+
+fn metadata_value_to_string(value: &serde_json::Value) -> Option<String> {
+    let raw = match value {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => value.to_string(),
+    };
+    let cleaned = clean_metadata_text(&raw);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn clean_metadata_text(value: &str) -> String {
+    let mut cleaned = value
+        .replace(['\r', '\n', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    const MAX_METADATA_VALUE_CHARS: usize = 160;
+    if cleaned.chars().count() > MAX_METADATA_VALUE_CHARS {
+        cleaned = cleaned
+            .chars()
+            .take(MAX_METADATA_VALUE_CHARS.saturating_sub(1))
+            .collect::<String>();
+        cleaned.push('…');
+    }
+    cleaned
+}
+
 /// Incoming webhook payload format.
 #[derive(Debug, Deserialize)]
 struct IncomingWebhook {
@@ -22,6 +183,95 @@ struct IncomingWebhook {
     content: String,
     #[serde(default)]
     thread_id: Option<String>,
+    #[serde(default, alias = "voice")]
+    voice_event: Option<IncomingVoiceEvent>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    stt_backend: Option<String>,
+    #[serde(default, alias = "stt_ms", alias = "transcription_ms")]
+    stt_latency_ms: Option<u64>,
+    #[serde(default, alias = "latency", alias = "elapsed_ms")]
+    latency_ms: Option<u64>,
+    #[serde(default, alias = "total_ms")]
+    total_latency_ms: Option<u64>,
+    #[serde(default, alias = "utterance_id")]
+    audio_id: Option<String>,
+    #[serde(default, alias = "audio_file")]
+    audio_path: Option<String>,
+    #[serde(default)]
+    timing: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    timings: BTreeMap<String, serde_json::Value>,
+}
+
+impl IncomingWebhook {
+    fn voice_event(&self) -> Option<IncomingVoiceEvent> {
+        let mut event = self.voice_event.clone().unwrap_or_default();
+        event.merge_missing(IncomingVoiceEvent {
+            mode: self.mode.clone(),
+            stt_backend: self.stt_backend.clone(),
+            stt_latency_ms: self.stt_latency_ms,
+            latency_ms: self.latency_ms,
+            total_latency_ms: self.total_latency_ms,
+            audio_id: self.audio_id.clone(),
+            audio_path: self.audio_path.clone(),
+            timing: self.timing.clone(),
+            timings: self.timings.clone(),
+        });
+        (!event.is_empty()).then_some(event)
+    }
+
+    fn content_with_voice_context(&self) -> String {
+        let content = self.content.trim().to_string();
+        let Some(event) = self.voice_event() else {
+            return content;
+        };
+        let Some(block) = event.context_block() else {
+            return content;
+        };
+        format!("{content}\n\n{block}")
+    }
+}
+
+/// Outbound event envelope for receivers that want structured TTS behavior.
+///
+/// `content` stays at the top level for backward compatibility with older
+/// webhook TTS callbacks; receivers that understand `event` can use it for
+/// routing, timeline correlation, and explicit speech semantics.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct OutgoingWebhookEvent {
+    protocol: &'static str,
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    version: u8,
+    timestamp_ms: u64,
+    content_format: &'static str,
+    tts: OutgoingWebhookTtsEvent,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct OutgoingWebhookTtsEvent {
+    speak: bool,
+    format: &'static str,
+    interrupt_thinking: bool,
+}
+
+impl OutgoingWebhookEvent {
+    fn assistant_response(timestamp_ms: u64) -> Self {
+        Self {
+            protocol: "zeroclaw.webhook.event",
+            event_type: "assistant_response",
+            version: 1,
+            timestamp_ms,
+            content_format: "text/plain",
+            tts: OutgoingWebhookTtsEvent {
+                speak: true,
+                format: "plain_text",
+                interrupt_thinking: true,
+            },
+        }
+    }
 }
 
 /// Outgoing webhook payload format.
@@ -32,6 +282,16 @@ struct OutgoingWebhook {
     thread_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recipient: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<OutgoingWebhookEvent>,
+}
+
+fn unix_timestamp_ms() -> u64 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
 }
 
 impl WebhookChannel {
@@ -119,6 +379,7 @@ impl Channel for WebhookChannel {
             } else {
                 Some(message.recipient.clone())
             },
+            event: Some(OutgoingWebhookEvent::assistant_response(unix_timestamp_ms())),
         };
 
         let mut request = match self.send_method.as_str() {
@@ -229,12 +490,13 @@ impl Channel for WebhookChannel {
                 .thread_id
                 .clone()
                 .unwrap_or_else(|| payload.sender.clone());
+            let content = payload.content_with_voice_context();
 
             let msg = ChannelMessage {
                 id: format!("webhook_{seq}"),
                 sender: payload.sender,
                 reply_target,
-                content: payload.content,
+                content,
                 channel: "webhook".to_string(),
                 timestamp,
                 thread_ts: payload.thread_id,
@@ -351,11 +613,74 @@ mod tests {
     }
 
     #[test]
+    fn incoming_payload_deserializes_nested_voice_event() {
+        let json = r#"{
+            "sender": "button",
+            "content": "jaka jest pogoda",
+            "voice_event": {
+                "mode": "agent",
+                "stt_backend": "sherpa",
+                "stt_latency_ms": 812,
+                "audio_id": "utt-42",
+                "timing": {"record_ms": 1430, "queue_ms": 12}
+            }
+        }"#;
+        let payload: IncomingWebhook = serde_json::from_str(json).unwrap();
+        let event = payload.voice_event().expect("voice event should parse");
+
+        assert_eq!(event.mode.as_deref(), Some("agent"));
+        assert_eq!(event.stt_backend.as_deref(), Some("sherpa"));
+        assert_eq!(event.stt_latency_ms, Some(812));
+        assert_eq!(event.audio_id.as_deref(), Some("utt-42"));
+        assert_eq!(event.timing["record_ms"], serde_json::json!(1430));
+
+        let content = payload.content_with_voice_context();
+        assert!(content.starts_with("jaka jest pogoda"));
+        assert!(content.contains("[Voice event metadata]"));
+        assert!(content.contains("- mode: agent"));
+        assert!(content.contains("- stt_backend: sherpa"));
+        assert!(content.contains("- timing.record_ms: 1430"));
+    }
+
+    #[test]
+    fn incoming_payload_accepts_top_level_voice_event_fields() {
+        let json = r#"{
+            "sender": "button",
+            "content": "test",
+            "mode": "agent",
+            "stt_backend": "whisper",
+            "stt_ms": 1200,
+            "latency_ms": 1300,
+            "utterance_id": "utt-top"
+        }"#;
+        let payload: IncomingWebhook = serde_json::from_str(json).unwrap();
+        let event = payload
+            .voice_event()
+            .expect("top-level voice fields should parse");
+
+        assert_eq!(event.mode.as_deref(), Some("agent"));
+        assert_eq!(event.stt_backend.as_deref(), Some("whisper"));
+        assert_eq!(event.stt_latency_ms, Some(1200));
+        assert_eq!(event.latency_ms, Some(1300));
+        assert_eq!(event.audio_id.as_deref(), Some("utt-top"));
+    }
+
+    #[test]
+    fn incoming_payload_without_voice_event_keeps_content_plain() {
+        let json = r#"{"sender": "bob", "content": "hi"}"#;
+        let payload: IncomingWebhook = serde_json::from_str(json).unwrap();
+
+        assert!(payload.voice_event().is_none());
+        assert_eq!(payload.content_with_voice_context(), "hi");
+    }
+
+    #[test]
     fn outgoing_payload_serializes_content() {
         let payload = OutgoingWebhook {
             content: "response".into(),
             thread_id: Some("t1".into()),
             recipient: Some("zeroclaw_user".into()),
+            event: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["content"], "response");
@@ -369,11 +694,34 @@ mod tests {
             content: "response".into(),
             thread_id: None,
             recipient: None,
+            event: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["content"], "response");
         assert!(json.get("thread_id").is_none());
         assert!(json.get("recipient").is_none());
+        assert!(json.get("event").is_none());
+    }
+
+    #[test]
+    fn outgoing_payload_can_include_tts_event_protocol() {
+        let payload = OutgoingWebhook {
+            content: "odpowiedź".into(),
+            thread_id: Some("t1".into()),
+            recipient: Some("button".into()),
+            event: Some(OutgoingWebhookEvent::assistant_response(1234)),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(json["content"], "odpowiedź");
+        assert_eq!(json["event"]["protocol"], "zeroclaw.webhook.event");
+        assert_eq!(json["event"]["type"], "assistant_response");
+        assert_eq!(json["event"]["version"], 1);
+        assert_eq!(json["event"]["timestamp_ms"], 1234);
+        assert_eq!(json["event"]["content_format"], "text/plain");
+        assert_eq!(json["event"]["tts"]["speak"], true);
+        assert_eq!(json["event"]["tts"]["format"], "plain_text");
+        assert_eq!(json["event"]["tts"]["interrupt_thinking"], true);
     }
 
     #[test]

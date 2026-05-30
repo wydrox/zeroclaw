@@ -2,6 +2,7 @@
 
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
+pub mod audio_safe;
 pub mod orchestrator;
 pub mod util;
 

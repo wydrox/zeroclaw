@@ -51,6 +51,84 @@ Runs locally, listens on the mic, triggers agent interaction when it hears the w
 
 The agent doesn't send audio anywhere — wake detection is local. Only post-wake speech goes through STT and reaches the LLM.
 
+## Raspberry Pi push-to-talk profile (experimental)
+
+A local push-to-talk loop can keep audio, STT, and TTS on a Raspberry Pi while ZeroClaw owns channel orchestration, tool use, response policy, tracing, and handoff semantics. The recommended integration is the generic webhook channel:
+
+```toml
+[channels.webhook]
+enabled = true
+port = 42881
+listen_path = "/voice"
+send_url = "http://127.0.0.1:42882/tts"
+secret = "change-me"
+
+[channels.webhook.response_policy]
+mode = "voice"
+audio_safe = true
+error_style = "natural"
+allow_raw_errors = false
+max_spoken_chars = 600
+
+[pacing]
+loop_detection_enabled = true
+loop_detection_window_size = 20
+loop_detection_max_repeats = 3
+```
+
+The local button loop sends a transcript plus optional voice metadata:
+
+```json
+{
+  "sender": "rpi5-button",
+  "content": "jaka jest pogoda",
+  "thread_id": "local-voice",
+  "voice_event": {
+    "mode": "agent",
+    "stt_backend": "sherpa",
+    "stt_latency_ms": 812,
+    "audio_id": "utt-42",
+    "timing": { "record_ms": 1430, "queue_ms": 12 }
+  }
+}
+```
+
+Legacy/top-level metadata is also accepted (`mode`, `stt_backend`, `stt_ms`, `latency_ms`, `utterance_id`). ZeroClaw appends this as voice-event context for the turn and writes it into `runtime_trace` as `voice_turn_timeline` events.
+
+Outbound replies remain backward-compatible with text-only TTS callbacks by keeping `content` at the top level, and add a structured event envelope:
+
+```json
+{
+  "content": "Już sprawdzam pogodę.",
+  "recipient": "rpi5-button",
+  "thread_id": "local-voice",
+  "event": {
+    "protocol": "zeroclaw.webhook.event",
+    "type": "assistant_response",
+    "version": 1,
+    "content_format": "text/plain",
+    "tts": {
+      "speak": true,
+      "format": "plain_text",
+      "interrupt_thinking": true
+    }
+  }
+}
+```
+
+For broad implementation requests from voice, the response policy asks the user whether to continue locally step by step or prepare a handoff to the main agent. For medium-risk or multi-step local actions, it asks for a short yes/no confirmation before acting.
+
+Arm64 rollout path for Raspberry Pi:
+
+1. Run the manual **Cross-Platform Build** workflow.
+2. Download the `zeroclaw-aarch64-unknown-linux-gnu` artifact for Raspberry Pi OS / Debian arm64.
+3. On the Pi, back up the current binary, for example `sudo cp /usr/local/bin/zeroclaw /usr/local/bin/zeroclaw.bak`.
+4. Copy the new `zeroclaw` binary to `/usr/local/bin/zeroclaw` and make it executable.
+5. Add the webhook `response_policy` config shown above and restart the voice channel service.
+6. Test a short weather query, a broad implementation request, and a forced repeated-tool prompt before leaving it unattended.
+
+See `dev/config.rpi-voice.toml` for a partial sample configuration.
+
 ## TTS (outbound speech synthesis)
 
 ```toml

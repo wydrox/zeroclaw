@@ -1193,6 +1193,7 @@ mod tests {
             send_method: None,
             auth_header: None,
             secret: None,
+            response_policy: None,
         });
         assert!(has_supervised_channels(&config));
     }

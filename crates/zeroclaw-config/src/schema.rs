@@ -7500,6 +7500,55 @@ impl ChannelConfig for MattermostConfig {
     }
 }
 
+/// Channel response mode for output post-processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelResponseMode {
+    /// Preserve existing channel response behavior.
+    #[default]
+    Normal,
+    /// Optimize replies for spoken voice/TTS output.
+    Voice,
+}
+
+/// Error presentation style for channel responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelErrorStyle {
+    /// Preserve raw error text for operator/debug channels.
+    #[default]
+    Raw,
+    /// Map failures to short natural-language messages.
+    Natural,
+}
+
+/// Per-channel response policy.
+///
+/// This is primarily useful for voice/TTS channels where raw technical errors
+/// and Markdown-heavy output should not be sent directly to users.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.webhook.response_policy"]
+pub struct ChannelResponsePolicyConfig {
+    /// Response mode. `voice` enables TTS-oriented response handling.
+    #[serde(default)]
+    pub mode: ChannelResponseMode,
+    /// When true, map channel errors to audio-safe natural language.
+    #[serde(default)]
+    pub audio_safe: bool,
+    /// Optional maximum spoken response length in characters.
+    #[serde(default)]
+    pub max_spoken_chars: Option<usize>,
+    /// Error presentation style. `natural` avoids raw stack/tool/provider errors.
+    #[serde(default)]
+    pub error_style: ChannelErrorStyle,
+    /// If true, bypass audio-safe error mapping and send raw errors.
+    #[serde(default)]
+    pub allow_raw_errors: bool,
+}
+
 /// Webhook channel configuration.
 ///
 /// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
@@ -7529,6 +7578,10 @@ pub struct WebhookConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secret: Option<String>,
+    /// Optional response policy for outbound webhook replies.
+    #[serde(default)]
+    #[nested]
+    pub response_policy: Option<ChannelResponsePolicyConfig>,
 }
 
 impl ChannelConfig for WebhookConfig {
@@ -12018,6 +12071,8 @@ impl_enum_prop_kind!(
     SearchMode,
     CronScheduleDecl,
     StreamMode,
+    ChannelResponseMode,
+    ChannelErrorStyle,
     WhatsAppWebMode,
     WhatsAppChatPolicy,
     LineDmPolicy,

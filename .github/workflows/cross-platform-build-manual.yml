@@ -52,6 +52,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            # Raspberry Pi 5 / Debian arm64 smoke build target.
             target: aarch64-unknown-linux-gnu
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
@@ -92,3 +93,12 @@ jobs:
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
           cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/zeroclaw
+            target/${{ matrix.target }}/release/zeroclaw.exe
+          if-no-files-found: error
+          retention-days: 14
