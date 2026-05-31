@@ -93,7 +93,7 @@ The local button loop sends a transcript plus optional voice metadata:
 }
 ```
 
-Legacy/top-level metadata is also accepted (`mode`, `stt_backend`, `stt_ms`, `latency_ms`, `utterance_id`). ZeroClaw appends this as voice-event context for the turn and writes it into `runtime_trace` as `voice_turn_timeline` events.
+Legacy/top-level metadata is also accepted (`mode`, `stt_backend`, `stt_ms`, `latency_ms`, `utterance_id`). ZeroClaw stores this as bounded schema-only voice-event attachment data for trace correlation, keeps it out of prompt-visible text, and writes it into `runtime_trace` as `voice_turn_timeline` events.
 
 Outbound replies remain backward-compatible with text-only TTS callbacks by keeping `content` at the top level, and add a structured event envelope:
 
