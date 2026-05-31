@@ -459,6 +459,10 @@ fn voice_tool_argument_context(tool: &str, args: Option<&str>) -> Option<String>
                 Some("polecenie systemowe".to_string())
             }
         }),
+        "weather" => pick("location")
+            .or_else(|| pick("place"))
+            .or_else(|| pick("city"))
+            .and_then(clean_voice_progress_context),
         "memory_search" | "memory_recall" => pick("query").and_then(clean_voice_progress_context),
         _ => pick("query")
             .or_else(|| pick("path"))
@@ -478,6 +482,7 @@ fn voice_tool_started_text(tool: &str, context: Option<&str>) -> Option<String> 
         // updates, which avoids delaying the final spoken answer with stale
         // "starting" messages after a sub-10ms tool already finished.
         "web_search_tool" | "web_search" => Some(with_context("Szukam w internecie")),
+        "weather" => Some(with_context("Sprawdzam pogodę dla")),
         "shell" => Some(with_context("Sprawdzam system bez zmian")),
         "delegate" | "subagent" => Some("Przekazuję krok pomocniczemu agentowi.".to_string()),
         _ => None,
@@ -503,8 +508,12 @@ fn voice_tool_completed_text(tool: &str, context: Option<&str>, success: bool) -
         "content_search" => with_context("Mam wynik z treści plików dla"),
         "file_read" | "read_file" => with_context("Mam zawartość pliku"),
         "shell" => with_context("Mam wynik sprawdzenia"),
+        "weather" => with_context("Mam prognozę dla"),
         "memory_search" | "memory_recall" => with_context("Mam wynik z pamięci dla"),
-        _ => with_context("Ten krok jest gotowy dla"),
+        _ => match context {
+            Some(context) if !context.is_empty() => format!("Ten krok jest gotowy: {context}."),
+            _ => "Ten krok jest gotowy.".to_string(),
+        },
     }
 }
 
@@ -11383,6 +11392,27 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             voice_tool_completed_text("file_read", Some("SOUL.md"), true),
             "Mam zawartość pliku: SOUL.md."
+        );
+        let weather_args = serde_json::json!({
+            "location": "Karwieńskie Błota Drugie",
+            "days": 2,
+        })
+        .to_string();
+        assert_eq!(
+            voice_tool_argument_context("weather", Some(&weather_args)).as_deref(),
+            Some("Karwieńskie Błota Drugie")
+        );
+        assert_eq!(
+            voice_tool_started_text("weather", Some("Karwieńskie Błota Drugie")).as_deref(),
+            Some("Sprawdzam pogodę dla: Karwieńskie Błota Drugie.")
+        );
+        assert_eq!(
+            voice_tool_completed_text("weather", Some("Karwieńskie Błota Drugie"), true),
+            "Mam prognozę dla: Karwieńskie Błota Drugie."
+        );
+        assert_eq!(
+            voice_tool_completed_text("unknown_tool", None, true),
+            "Ten krok jest gotowy."
         );
     }
 
