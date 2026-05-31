@@ -123,9 +123,11 @@ static CRON_CHANNEL_REGISTRY: OnceLock<Arc<HashMap<String, Arc<dyn Channel>>>> =
 enum VoiceProgressEvent {
     ToolStarted {
         tool: String,
+        context: Option<String>,
     },
     ToolCompleted {
         tool: String,
+        context: Option<String>,
         duration_ms: u64,
         success: bool,
     },
@@ -135,6 +137,7 @@ struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     voice_progress_tx: Option<tokio::sync::mpsc::UnboundedSender<VoiceProgressEvent>>,
+    voice_tool_context: Mutex<HashMap<String, String>>,
     tools_used: AtomicBool,
 }
 
@@ -166,8 +169,18 @@ impl Observer for ChannelNotifyObserver {
                     _ => String::new(),
                 };
                 let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
+                let context = voice_tool_argument_context(tool, arguments.as_deref());
+                if let Some(context) = context.as_ref() {
+                    self.voice_tool_context
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(tool.clone(), context.clone());
+                }
                 if let Some(tx) = &self.voice_progress_tx {
-                    let _ = tx.send(VoiceProgressEvent::ToolStarted { tool: tool.clone() });
+                    let _ = tx.send(VoiceProgressEvent::ToolStarted {
+                        tool: tool.clone(),
+                        context,
+                    });
                 }
             }
             ObserverEvent::ToolCall {
@@ -177,8 +190,14 @@ impl Observer for ChannelNotifyObserver {
             } => {
                 if let Some(tx) = &self.voice_progress_tx {
                     let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                    let context = self
+                        .voice_tool_context
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(tool);
                     let _ = tx.send(VoiceProgressEvent::ToolCompleted {
                         tool: tool.clone(),
+                        context,
                         duration_ms,
                         success: *success,
                     });
@@ -379,31 +398,113 @@ fn initial_voice_progress_text(content: &str) -> &'static str {
     }
 }
 
-fn voice_tool_started_text(tool: &str) -> Option<&'static str> {
+fn clean_voice_progress_context(value: &str) -> Option<String> {
+    let cleaned = value
+        .replace(['`', '*', '_', '#', '{', '}', '[', ']', '|'], "")
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(truncate_with_ellipsis(cleaned, 90))
+    }
+}
+
+fn safe_file_label(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let label = Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(trimmed);
+    clean_voice_progress_context(label)
+}
+
+fn voice_tool_argument_context(tool: &str, args: Option<&str>) -> Option<String> {
+    let args = args?;
+    let value = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    let pick = |key: &str| value.get(key).and_then(|v| v.as_str());
+
+    match tool {
+        "web_search_tool" | "web_search" => pick("query")
+            .or_else(|| pick("search"))
+            .or_else(|| pick("q"))
+            .and_then(clean_voice_progress_context),
+        "glob_search" => {
+            if let Some(path) = pick("path") {
+                safe_file_label(path)
+            } else {
+                pick("pattern")
+                    .or_else(|| pick("query"))
+                    .and_then(clean_voice_progress_context)
+            }
+        }
+        "content_search" => pick("query")
+            .or_else(|| pick("pattern"))
+            .and_then(clean_voice_progress_context),
+        "file_read" | "read_file" => pick("path")
+            .or_else(|| pick("file"))
+            .and_then(safe_file_label),
+        "shell" => pick("command").and_then(|command| {
+            let lower = command.to_ascii_lowercase();
+            if lower.contains("systemctl") && lower.contains("status") {
+                Some("status usługi".to_string())
+            } else {
+                Some("polecenie systemowe".to_string())
+            }
+        }),
+        "memory_search" | "memory_recall" => pick("query").and_then(clean_voice_progress_context),
+        _ => pick("query")
+            .or_else(|| pick("path"))
+            .or_else(|| pick("name"))
+            .and_then(clean_voice_progress_context),
+    }
+}
+
+fn voice_tool_started_text(tool: &str, context: Option<&str>) -> Option<String> {
+    let with_context = |prefix: &str| match context {
+        Some(context) if !context.is_empty() => format!("{prefix}: {context}."),
+        _ => format!("{prefix}."),
+    };
     match tool {
         // Start updates are reserved for tools that are likely to be slow or
         // externally visible. Fast local reads/searches still emit completion
         // updates, which avoids delaying the final spoken answer with stale
         // "starting" messages after a sub-10ms tool already finished.
-        "web_search_tool" | "web_search" => Some("Szukam w internecie."),
-        "shell" => Some("Sprawdzam system bez zmian."),
-        "delegate" | "subagent" => Some("Przekazuję krok pomocniczemu agentowi."),
+        "web_search_tool" | "web_search" => Some(with_context("Szukam w internecie")),
+        "shell" => Some(with_context("Sprawdzam system bez zmian")),
+        "delegate" | "subagent" => Some("Przekazuję krok pomocniczemu agentowi.".to_string()),
         _ => None,
     }
 }
 
-fn voice_tool_completed_text(tool: &str, success: bool) -> &'static str {
+fn voice_tool_completed_text(tool: &str, context: Option<&str>, success: bool) -> String {
     if !success {
-        return "Ten krok się nie udał, wybieram bezpieczną kontynuację.";
+        return match context {
+            Some(context) if !context.is_empty() => {
+                format!("Nie udał się krok dla: {context}. Wybieram bezpieczną kontynuację.")
+            }
+            _ => "Ten krok się nie udał, wybieram bezpieczną kontynuację.".to_string(),
+        };
     }
+    let with_context = |prefix: &str| match context {
+        Some(context) if !context.is_empty() => format!("{prefix}: {context}."),
+        _ => format!("{prefix}."),
+    };
     match tool {
-        "web_search_tool" | "web_search" => "Mam wynik z internetu.",
-        "glob_search" => "Mam wynik z listy plików.",
-        "content_search" => "Mam wynik z treści plików.",
-        "file_read" | "read_file" => "Mam zawartość pliku.",
-        "shell" => "Mam wynik sprawdzenia systemu.",
-        "memory_search" | "memory_recall" => "Mam wynik z pamięci.",
-        _ => "Ten krok jest gotowy.",
+        "web_search_tool" | "web_search" => with_context("Mam wynik z internetu dla"),
+        "glob_search" => with_context("Mam wynik z listy plików dla"),
+        "content_search" => with_context("Mam wynik z treści plików dla"),
+        "file_read" | "read_file" => with_context("Mam zawartość pliku"),
+        "shell" => with_context("Mam wynik sprawdzenia"),
+        "memory_search" | "memory_recall" => with_context("Mam wynik z pamięci dla"),
+        _ => with_context("Ten krok jest gotowy dla"),
     }
 }
 
@@ -3629,6 +3730,7 @@ async fn process_channel_message(
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
         voice_progress_tx,
+        voice_tool_context: Mutex::new(HashMap::new()),
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
@@ -3665,27 +3767,29 @@ async fn process_channel_message(
         let voice_event_for_progress = voice_event_metadata.clone();
         Some(tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                let (text, progress_kind, tool, duration_ms, success) = match event {
-                    VoiceProgressEvent::ToolStarted { tool } => {
-                        let Some(text) = voice_tool_started_text(&tool) else {
+                let (text, progress_kind, tool, context, duration_ms, success) = match event {
+                    VoiceProgressEvent::ToolStarted { tool, context } => {
+                        let Some(text) = voice_tool_started_text(&tool, context.as_deref()) else {
                             continue;
                         };
-                        (text, "tool_started", tool, None, None)
+                        (text, "tool_started", tool, context, None, None)
                     }
                     VoiceProgressEvent::ToolCompleted {
                         tool,
+                        context,
                         duration_ms,
                         success,
                     } => (
-                        voice_tool_completed_text(&tool, success),
+                        voice_tool_completed_text(&tool, context.as_deref(), success),
                         "tool_completed",
                         tool,
+                        context,
                         Some(duration_ms),
                         Some(success),
                     ),
                 };
 
-                if let Err(err) = send_progress_update(&channel, &msg_for_progress, text).await {
+                if let Err(err) = send_progress_update(&channel, &msg_for_progress, &text).await {
                     tracing::debug!("Failed to send tool voice progress update: {err}");
                     continue;
                 }
@@ -3701,6 +3805,9 @@ async fn process_channel_message(
                     if let Some(success) = success {
                         map.insert("success".to_string(), serde_json::json!(success));
                     }
+                    if let Some(context) = context.as_ref() {
+                        map.insert("context".to_string(), serde_json::json!(context));
+                    }
                 }
                 record_voice_turn_timeline(
                     "assistant_progress",
@@ -3708,7 +3815,7 @@ async fn process_channel_message(
                     Some(provider_for_progress.as_str()),
                     Some(model_for_progress.as_str()),
                     success,
-                    Some(text),
+                    Some(&text),
                     0,
                     voice_event_for_progress.as_ref(),
                     extra,
@@ -11262,12 +11369,31 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn voice_tool_progress_uses_sanitized_argument_context() {
+        let web_args = serde_json::json!({"query": "oficjalna strona Raspberry Pi"}).to_string();
+        assert_eq!(
+            voice_tool_argument_context("web_search_tool", Some(&web_args)).as_deref(),
+            Some("oficjalna strona Raspberry Pi")
+        );
+        assert_eq!(
+            voice_tool_started_text("web_search_tool", Some("oficjalna strona Raspberry Pi"))
+                .as_deref(),
+            Some("Szukam w internecie: oficjalna strona Raspberry Pi.")
+        );
+        assert_eq!(
+            voice_tool_completed_text("file_read", Some("SOUL.md"), true),
+            "Mam zawartość pliku: SOUL.md."
+        );
+    }
+
+    #[test]
     fn channel_notify_observer_truncates_utf8_arguments_safely() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
             tx,
             voice_progress_tx: None,
+            voice_tool_context: Mutex::new(HashMap::new()),
             tools_used: AtomicBool::new(false),
         };
 
