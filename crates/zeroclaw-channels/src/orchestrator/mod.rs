@@ -119,39 +119,72 @@ static CRON_CHANNEL_REGISTRY: OnceLock<Arc<HashMap<String, Arc<dyn Channel>>>> =
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
+#[derive(Debug, Clone)]
+enum VoiceProgressEvent {
+    ToolStarted {
+        tool: String,
+    },
+    ToolCompleted {
+        tool: String,
+        duration_ms: u64,
+        success: bool,
+    },
+}
+
 struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
+    voice_progress_tx: Option<tokio::sync::mpsc::UnboundedSender<VoiceProgressEvent>>,
     tools_used: AtomicBool,
 }
 
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        if let ObserverEvent::ToolCallStart { tool, arguments } = event {
-            self.tools_used.store(true, Ordering::Relaxed);
-            let detail = match arguments {
-                Some(args) if !args.is_empty() => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                            format!(": `{}`", truncate_with_ellipsis(cmd, 200))
-                        } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
-                            format!(": {}", truncate_with_ellipsis(q, 200))
-                        } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
-                            format!(": {p}")
-                        } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
-                            format!(": {u}")
+        match event {
+            ObserverEvent::ToolCallStart { tool, arguments } => {
+                self.tools_used.store(true, Ordering::Relaxed);
+                let detail = match arguments {
+                    Some(args) if !args.is_empty() => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+                            if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                                format!(": `{}`", truncate_with_ellipsis(cmd, 200))
+                            } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
+                                format!(": {}", truncate_with_ellipsis(q, 200))
+                            } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
+                                format!(": {p}")
+                            } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
+                                format!(": {u}")
+                            } else {
+                                let s = args.to_string();
+                                format!(": {}", truncate_with_ellipsis(&s, 120))
+                            }
                         } else {
                             let s = args.to_string();
                             format!(": {}", truncate_with_ellipsis(&s, 120))
                         }
-                    } else {
-                        let s = args.to_string();
-                        format!(": {}", truncate_with_ellipsis(&s, 120))
                     }
+                    _ => String::new(),
+                };
+                let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
+                if let Some(tx) = &self.voice_progress_tx {
+                    let _ = tx.send(VoiceProgressEvent::ToolStarted { tool: tool.clone() });
                 }
-                _ => String::new(),
-            };
-            let _ = self.tx.send(format!("\u{1F527} `{tool}`{detail}"));
+            }
+            ObserverEvent::ToolCall {
+                tool,
+                duration,
+                success,
+            } => {
+                if let Some(tx) = &self.voice_progress_tx {
+                    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                    let _ = tx.send(VoiceProgressEvent::ToolCompleted {
+                        tool: tool.clone(),
+                        duration_ms,
+                        success: *success,
+                    });
+                }
+            }
+            _ => {}
         }
         self.inner.record_event(event);
     }
@@ -296,6 +329,92 @@ fn response_policy_uses_audio_safe_errors(
             policy.error_style,
             zeroclaw_config::schema::ChannelErrorStyle::Natural
         )
+}
+
+fn channel_uses_progressive_voice(config: &Config, channel_name: &str) -> bool {
+    webhook_response_policy(config, channel_name).is_some_and(response_policy_formats_audio)
+}
+
+fn mentions_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn initial_voice_progress_text(content: &str) -> &'static str {
+    let lower = content.to_ascii_lowercase();
+    let wants_web = mentions_any(
+        &lower,
+        &["web", "internet", "stron", "wyszuk", "search", "oficjaln"],
+    );
+    let wants_files = mentions_any(
+        &lower,
+        &["plik", "workspace", "repo", "config", "konfigur", "lokaln"],
+    );
+    let wants_status = mentions_any(&lower, &["status", "usług", "service", "systemctl"]);
+    let risky = mentions_any(
+        &lower,
+        &[
+            "restart",
+            "usuń",
+            "usun",
+            "kasuj",
+            "wyczyść",
+            "wyczysc",
+            "zmień",
+            "zmien",
+        ],
+    );
+
+    if risky {
+        "To może zmienić system, więc najpierw sprawdzę bezpieczny zakres."
+    } else if wants_web && wants_files {
+        "Sprawdzę źródło w internecie i lokalne pliki."
+    } else if wants_web {
+        "Sprawdzę źródło w internecie."
+    } else if wants_files {
+        "Sprawdzę lokalne pliki."
+    } else if wants_status {
+        "Sprawdzę status bez wprowadzania zmian."
+    } else {
+        "Przyjmuję zadanie i sprawdzam pierwszy krok."
+    }
+}
+
+fn voice_tool_started_text(tool: &str) -> Option<&'static str> {
+    match tool {
+        // Start updates are reserved for tools that are likely to be slow or
+        // externally visible. Fast local reads/searches still emit completion
+        // updates, which avoids delaying the final spoken answer with stale
+        // "starting" messages after a sub-10ms tool already finished.
+        "web_search_tool" | "web_search" => Some("Szukam w internecie."),
+        "shell" => Some("Sprawdzam system bez zmian."),
+        "delegate" | "subagent" => Some("Przekazuję krok pomocniczemu agentowi."),
+        _ => None,
+    }
+}
+
+fn voice_tool_completed_text(tool: &str, success: bool) -> &'static str {
+    if !success {
+        return "Ten krok się nie udał, wybieram bezpieczną kontynuację.";
+    }
+    match tool {
+        "web_search_tool" | "web_search" => "Mam wynik z internetu.",
+        "glob_search" => "Mam wynik z listy plików.",
+        "content_search" => "Mam wynik z treści plików.",
+        "file_read" | "read_file" => "Mam zawartość pliku.",
+        "shell" => "Mam wynik sprawdzenia systemu.",
+        "memory_search" | "memory_recall" => "Mam wynik z pamięci.",
+        _ => "Ten krok jest gotowy.",
+    }
+}
+
+async fn send_progress_update(
+    channel: &Arc<dyn Channel>,
+    msg: &ChannelMessage,
+    text: &str,
+) -> Result<()> {
+    channel
+        .send_progress(&SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
 }
 
 fn classify_channel_failure(error: &str) -> ChannelFailureKind {
@@ -3109,6 +3228,26 @@ async fn process_channel_message(
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
+    let progressive_voice_enabled =
+        channel_uses_progressive_voice(ctx.prompt_config.as_ref(), &msg.channel);
+    if progressive_voice_enabled && let Some(channel) = target_channel.as_ref() {
+        let progress_text = initial_voice_progress_text(&msg.content);
+        if let Err(err) = send_progress_update(channel, &msg, progress_text).await {
+            tracing::debug!("Failed to send initial voice progress update: {err}");
+        } else {
+            record_voice_turn_timeline(
+                "assistant_progress",
+                &msg,
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                Some(true),
+                Some(progress_text),
+                0,
+                voice_event_metadata.as_ref(),
+                serde_json::json!({"progress_kind": "initial"}),
+            );
+        }
+    }
 
     let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
     if force_fresh_session {
@@ -3478,11 +3617,18 @@ async fn process_channel_message(
         _ => None,
     };
 
-    // Wrap observer to forward tool events as live thread messages
+    // Wrap observer to forward tool events as live thread/progressive voice messages.
+    let (voice_progress_tx, mut voice_progress_rx) = if progressive_voice_enabled {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<VoiceProgressEvent>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
+        voice_progress_tx,
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
@@ -3507,6 +3653,70 @@ async fn process_channel_message(
                 }
             }
         }))
+    };
+
+    let voice_progress_task = if let (Some(mut rx), Some(channel_ref)) =
+        (voice_progress_rx.take(), target_channel.as_ref())
+    {
+        let channel = Arc::clone(channel_ref);
+        let msg_for_progress = msg.clone();
+        let provider_for_progress = route.provider.clone();
+        let model_for_progress = route.model.clone();
+        let voice_event_for_progress = voice_event_metadata.clone();
+        Some(tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let (text, progress_kind, tool, duration_ms, success) = match event {
+                    VoiceProgressEvent::ToolStarted { tool } => {
+                        let Some(text) = voice_tool_started_text(&tool) else {
+                            continue;
+                        };
+                        (text, "tool_started", tool, None, None)
+                    }
+                    VoiceProgressEvent::ToolCompleted {
+                        tool,
+                        duration_ms,
+                        success,
+                    } => (
+                        voice_tool_completed_text(&tool, success),
+                        "tool_completed",
+                        tool,
+                        Some(duration_ms),
+                        Some(success),
+                    ),
+                };
+
+                if let Err(err) = send_progress_update(&channel, &msg_for_progress, text).await {
+                    tracing::debug!("Failed to send tool voice progress update: {err}");
+                    continue;
+                }
+
+                let mut extra = serde_json::json!({
+                    "progress_kind": progress_kind,
+                    "tool": tool,
+                });
+                if let serde_json::Value::Object(ref mut map) = extra {
+                    if let Some(duration_ms) = duration_ms {
+                        map.insert("duration_ms".to_string(), serde_json::json!(duration_ms));
+                    }
+                    if let Some(success) = success {
+                        map.insert("success".to_string(), serde_json::json!(success));
+                    }
+                }
+                record_voice_turn_timeline(
+                    "assistant_progress",
+                    &msg_for_progress,
+                    Some(provider_for_progress.as_str()),
+                    Some(model_for_progress.as_str()),
+                    success,
+                    Some(text),
+                    0,
+                    voice_event_for_progress.as_ref(),
+                    extra,
+                );
+            }
+        }))
+    } else {
+        None
     };
 
     enum LlmExecutionResult {
@@ -3676,6 +3886,9 @@ async fn process_channel_message(
     drop(notify_observer);
     drop(notify_observer_flag);
     if let Some(handle) = notify_task {
+        let _ = handle.await;
+    }
+    if let Some(handle) = voice_progress_task {
         let _ = handle.await;
     }
 
@@ -11054,6 +11267,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
             tx,
+            voice_progress_tx: None,
             tools_used: AtomicBool::new(false),
         };
 

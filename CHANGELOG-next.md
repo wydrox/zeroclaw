@@ -66,7 +66,7 @@
 
 ### Channels
 
-- **Raspberry Pi voice profile groundwork:** started a local fork plan for a first-class Raspberry Pi push-to-talk voice profile and added the first voice-channel building blocks: per-webhook `response_policy`, audio-safe channel errors, TTS-oriented formatting, one-time loop recovery before safe abort, prompt-level handoff/confirmation guidance for voice turns, and schema-only voice-event metadata attachments that keep STT/runtime metadata out of prompt-visible text (`FORK_PLAN_RPI_VOICE.md`).
+- **Raspberry Pi voice profile groundwork:** started a local fork plan for a first-class Raspberry Pi push-to-talk voice profile and added the first voice-channel building blocks: per-webhook `response_policy`, audio-safe channel errors, TTS-oriented formatting, one-time loop recovery before safe abort, prompt-level handoff/confirmation guidance for voice turns, schema-only voice-event metadata attachments that keep STT/runtime metadata out of prompt-visible text, and progressive webhook voice updates so a turn can speak a short contextual acknowledgement plus tool-start/tool-complete updates before the final summary (`FORK_PLAN_RPI_VOICE.md`).
 - **ACP (Agent Client Protocol):** `session/cancel` aborts in-flight turns
   (#6374); concurrent `session/prompt` requests are rejected rather than
   raced (#6408); ACP protocol v1 picks up tool-call permission and a back-channel

@@ -121,6 +121,16 @@ pub trait Channel: Send + Sync {
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
+    /// Send a user-visible progress update for the current turn.
+    ///
+    /// Channels that have a structured progress/voice surface can override this
+    /// to tag the outbound payload differently from a final assistant response.
+    /// The default keeps existing channels backward-compatible by sending a
+    /// normal message.
+    async fn send_progress(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.send(message).await
+    }
+
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
 

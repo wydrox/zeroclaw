@@ -282,6 +282,21 @@ impl OutgoingWebhookEvent {
             },
         }
     }
+
+    fn assistant_progress(timestamp_ms: u64) -> Self {
+        Self {
+            protocol: "zeroclaw.webhook.event",
+            event_type: "assistant_progress",
+            version: 1,
+            timestamp_ms,
+            content_format: "text/plain",
+            tts: OutgoingWebhookTtsEvent {
+                speak: true,
+                format: "plain_text",
+                interrupt_thinking: true,
+            },
+        }
+    }
 }
 
 /// Outgoing webhook payload format.
@@ -337,6 +352,51 @@ impl WebhookChannel {
         zeroclaw_config::schema::build_runtime_proxy_client("channel.webhook")
     }
 
+    async fn send_outgoing(
+        &self,
+        message: &SendMessage,
+        event: OutgoingWebhookEvent,
+    ) -> Result<()> {
+        let Some(ref send_url) = self.send_url else {
+            tracing::debug!("Webhook channel: no send_url configured, skipping outbound message");
+            return Ok(());
+        };
+
+        let client = self.http_client();
+        let payload = OutgoingWebhook {
+            content: message.content.clone(),
+            thread_id: message.thread_ts.clone(),
+            recipient: if message.recipient.is_empty() {
+                None
+            } else {
+                Some(message.recipient.clone())
+            },
+            event: Some(event),
+        };
+
+        let mut request = match self.send_method.as_str() {
+            "PUT" => client.put(send_url),
+            _ => client.post(send_url),
+        };
+
+        if let Some(ref auth) = self.auth_header {
+            request = request.header("Authorization", auth);
+        }
+
+        let resp = request.json(&payload).send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
+            bail!("Webhook send failed ({status}): {body}");
+        }
+
+        Ok(())
+    }
+
     /// Verify an incoming request's signature if a secret is configured.
     #[cfg(test)]
     fn verify_signature(&self, body: &[u8], signature: Option<&str>) -> bool {
@@ -375,44 +435,19 @@ impl Channel for WebhookChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        let Some(ref send_url) = self.send_url else {
-            tracing::debug!("Webhook channel: no send_url configured, skipping outbound message");
-            return Ok(());
-        };
+        self.send_outgoing(
+            message,
+            OutgoingWebhookEvent::assistant_response(unix_timestamp_ms()),
+        )
+        .await
+    }
 
-        let client = self.http_client();
-        let payload = OutgoingWebhook {
-            content: message.content.clone(),
-            thread_id: message.thread_ts.clone(),
-            recipient: if message.recipient.is_empty() {
-                None
-            } else {
-                Some(message.recipient.clone())
-            },
-            event: Some(OutgoingWebhookEvent::assistant_response(unix_timestamp_ms())),
-        };
-
-        let mut request = match self.send_method.as_str() {
-            "PUT" => client.put(send_url),
-            _ => client.post(send_url),
-        };
-
-        if let Some(ref auth) = self.auth_header {
-            request = request.header("Authorization", auth);
-        }
-
-        let resp = request.json(&payload).send().await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Webhook send failed ({status}): {body}");
-        }
-
-        Ok(())
+    async fn send_progress(&self, message: &SendMessage) -> Result<()> {
+        self.send_outgoing(
+            message,
+            OutgoingWebhookEvent::assistant_progress(unix_timestamp_ms()),
+        )
+        .await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -806,6 +841,22 @@ mod tests {
         assert_eq!(json["event"]["tts"]["speak"], true);
         assert_eq!(json["event"]["tts"]["format"], "plain_text");
         assert_eq!(json["event"]["tts"]["interrupt_thinking"], true);
+    }
+
+    #[test]
+    fn outgoing_payload_can_mark_assistant_progress() {
+        let payload = OutgoingWebhook {
+            content: "Szukam w internecie.".into(),
+            thread_id: Some("t1".into()),
+            recipient: Some("button".into()),
+            event: Some(OutgoingWebhookEvent::assistant_progress(5678)),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(json["content"], "Szukam w internecie.");
+        assert_eq!(json["event"]["type"], "assistant_progress");
+        assert_eq!(json["event"]["timestamp_ms"], 5678);
+        assert_eq!(json["event"]["tts"]["speak"], true);
     }
 
     #[test]

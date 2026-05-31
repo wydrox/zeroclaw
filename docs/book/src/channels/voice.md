@@ -95,7 +95,7 @@ The local button loop sends a transcript plus optional voice metadata:
 
 Legacy/top-level metadata is also accepted (`mode`, `stt_backend`, `stt_ms`, `latency_ms`, `utterance_id`). ZeroClaw stores this as bounded schema-only voice-event attachment data for trace correlation, keeps it out of prompt-visible text, and writes it into `runtime_trace` as `voice_turn_timeline` events.
 
-Outbound replies remain backward-compatible with text-only TTS callbacks by keeping `content` at the top level, and add a structured event envelope:
+Outbound replies and progress updates remain backward-compatible with text-only TTS callbacks by keeping `content` at the top level, and add a structured event envelope. Final replies use `assistant_response`; progressive voice updates use `assistant_progress` and are emitted for the initial contextual acknowledgement plus tool-start/tool-complete milestones when the webhook `response_policy` is in voice/audio-safe mode:
 
 ```json
 {
@@ -104,7 +104,7 @@ Outbound replies remain backward-compatible with text-only TTS callbacks by keep
   "thread_id": "local-voice",
   "event": {
     "protocol": "zeroclaw.webhook.event",
-    "type": "assistant_response",
+    "type": "assistant_progress",
     "version": 1,
     "content_format": "text/plain",
     "tts": {
